@@ -7,6 +7,7 @@
         <router-link to="/runs">范围核验台</router-link>
         <router-link to="/ingestion">接入登记台</router-link>
         <router-link to="/releases">发布版本管理</router-link>
+        <router-link to="/regulatory">监管答复</router-link>
         <router-link to="/external">外部接口（脱敏）</router-link>
       </nav>
       <div class="small" style="margin-top:26px;line-height:1.7">

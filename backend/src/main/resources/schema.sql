@@ -1,5 +1,6 @@
 -- 药品批次谱系数据质量与召回影响服务 · 审计级 schema
 -- 所有事实均保留：原始载荷、接收时间、事件时间、来源修订号、文件哈希、解析版本
+-- feature-5 监管答复：问题册 / 策略册 / 答复日快照 / 聚合单元格 / 核平 / 授权 / 审计
 
 CREATE TABLE IF NOT EXISTS source_package (
     id                       BIGSERIAL,
@@ -12,10 +13,16 @@ CREATE TABLE IF NOT EXISTS source_package (
     received_at              TIMESTAMPTZ NOT NULL,     -- 接收时间
     event_time               TIMESTAMPTZ NOT NULL,     -- 事件时间
     supersedes_package_code  TEXT,
+    status                   TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE / REVOKED（来源版本撤销）
+    revoked_at               TIMESTAMPTZ,
+    revoke_reason            TEXT,
     payload                  JSONB NOT NULL,           -- 原始载荷（内部可见，含敏感字段）
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (id)
 );
+ALTER TABLE source_package ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE source_package ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+ALTER TABLE source_package ADD COLUMN IF NOT EXISTS revoke_reason TEXT;
 
 CREATE TABLE IF NOT EXISTS parse_rule (
     version        TEXT PRIMARY KEY,
@@ -42,6 +49,13 @@ CREATE TABLE IF NOT EXISTS batch_master (
     quantity      NUMERIC(14,3),
     package_id    BIGINT REFERENCES source_package(id),
     attributes    JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- 机构主数据（监管答复地区维度的来源）
+CREATE TABLE IF NOT EXISTS institution (
+    inst_code   TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    region      TEXT NOT NULL
 );
 
 -- 核验请求（一次范围核验）：锁定检验更正版本 + 截止时间 + 输入快照
@@ -166,7 +180,133 @@ CREATE TABLE IF NOT EXISTS api_client (
     enabled   BOOLEAN NOT NULL DEFAULT true
 );
 
+-- ==================================================================
+-- feature-5 监管答复：最细仍可验证的汇总，而非整包脱敏导出
+-- ==================================================================
+
+-- 问题册：监管问询必须证明的事实
+CREATE TABLE IF NOT EXISTS question_book (
+    question_code      TEXT PRIMARY KEY,
+    title              TEXT NOT NULL,
+    required_dims      JSONB NOT NULL,        -- 必须证明的维度，如 ["region","month","evidenceGrade"]
+    required_measures  JSONB NOT NULL,        -- 必须证明的度量，如 ["confirmedQty","reportCount"]
+    description        TEXT NOT NULL DEFAULT '',
+    status             TEXT NOT NULL DEFAULT 'ACTIVE'
+);
+
+-- 策略册：禁止字段、最小单元格、允许维度（含维度层级，供聚合求解）
+CREATE TABLE IF NOT EXISTS policy_book (
+    policy_code           TEXT PRIMARY KEY,
+    version_no            INTEGER NOT NULL,
+    forbidden_fields      JSONB NOT NULL,     -- 禁止出现的字段
+    min_cell_size         INTEGER NOT NULL,   -- 最小单元格（机构数低于此值必须明确不披露）
+    allowed_dimensions    JSONB NOT NULL,     -- 允许用于聚合的维度
+    dimension_hierarchies JSONB NOT NULL,     -- 维度上卷层级，如 {"region":["national"],"month":["quarter","year"]}
+    effective_from        TIMESTAMPTZ NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'ACTIVE',
+    description           TEXT NOT NULL DEFAULT ''
+);
+
+-- 预批准模板：常见问询的固定地区/时间/证据层投影
+CREATE TABLE IF NOT EXISTS response_template (
+    template_code  TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    dimensions     JSONB NOT NULL,            -- 固定投影维度
+    measures       JSONB NOT NULL,            -- 固定度量
+    approved       BOOLEAN NOT NULL DEFAULT true,
+    description    TEXT NOT NULL DEFAULT ''
+);
+
+-- 监管答复（一次生成）
+CREATE TABLE IF NOT EXISTS regulatory_response (
+    id                   BIGSERIAL PRIMARY KEY,
+    response_code        TEXT NOT NULL UNIQUE,
+    inquiry_type         TEXT NOT NULL,        -- TEMPLATE / COMPLEX
+    template_code        TEXT,
+    question_codes       JSONB NOT NULL,
+    policy_code          TEXT NOT NULL,
+    response_date        TIMESTAMPTZ NOT NULL, -- 答复日（快照只含此前已发布范围/机构回报/证据等级）
+    release_id           BIGINT REFERENCES release_version(id),
+    status               TEXT NOT NULL,        -- GENERATED / CANCELLED / SUPERSEDED
+    dimensions           JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 选定解的聚合维度
+    information_loss     NUMERIC(14,3) NOT NULL DEFAULT 0,
+    equivalent_solutions JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 等价解及解释
+    constraint_conflicts JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 约束冲突及解释
+    cancelled_reason     TEXT,
+    created_by           TEXT NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 答复日快照：冻结当时已发布范围、机构回报（去重后）与证据等级分布
+CREATE TABLE IF NOT EXISTS response_snapshot (
+    id                    BIGSERIAL PRIMARY KEY,
+    response_id           BIGINT NOT NULL UNIQUE REFERENCES regulatory_response(id) ON DELETE CASCADE,
+    release_code          TEXT NOT NULL,
+    package_codes         JSONB NOT NULL,      -- 冻结来源包清单（撤销检查依据）
+    facts                 JSONB NOT NULL,      -- 扁平化答复事实（单元格聚合的输入）
+    raw_report_count      INTEGER NOT NULL,    -- 机构回报原始条数
+    dedup_report_count    INTEGER NOT NULL,    -- 同机构重复回报合并后的条数
+    merged_reports        JSONB NOT NULL,      -- 合并明细
+    out_of_scope_reports  JSONB NOT NULL,      -- 不在已发布范围内的回报
+    evidence_distribution JSONB NOT NULL,      -- 证据等级分布
+    quantity_totals       JSONB NOT NULL,      -- 三类数量合计
+    undefined_fields      JSONB NOT NULL,      -- 未定义字段（保持待复核）
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 聚合单元格：最小单元格不足时明确不披露（不用四舍五入掩盖机构）
+CREATE TABLE IF NOT EXISTS response_cell (
+    id                    BIGSERIAL PRIMARY KEY,
+    response_id           BIGINT NOT NULL REFERENCES regulatory_response(id) ON DELETE CASCADE,
+    cell_key              TEXT NOT NULL,
+    dimensions            JSONB NOT NULL,      -- 维度值，如 {"region":"华东","month":"2026-11","evidenceGrade":"POSSIBLE"}
+    institution_count     INTEGER NOT NULL,
+    report_count          INTEGER NOT NULL,
+    fact_count            INTEGER NOT NULL,
+    confirmed_qty         NUMERIC(14,3),
+    pending_qty           NUMERIC(14,3),
+    possible_qty          NUMERIC(14,3),
+    disclosed             BOOLEAN NOT NULL,
+    non_disclosure_reason TEXT,                -- 不披露理由（明确写出，不四舍五入）
+    UNIQUE (response_id, cell_key)
+);
+
+-- 核验器：输出同冻结来源的去重数与证据分布核平
+CREATE TABLE IF NOT EXISTS response_reconciliation (
+    id             BIGSERIAL PRIMARY KEY,
+    response_id    BIGINT NOT NULL REFERENCES regulatory_response(id) ON DELETE CASCADE,
+    metric         TEXT NOT NULL,        -- DEDUP_REPORT_COUNT / EVIDENCE_DISTRIBUTION / QUANTITY_TOTALS / UNDEFINED_FIELDS_PENDING
+    expected_value TEXT NOT NULL,
+    actual_value   TEXT NOT NULL,
+    status         TEXT NOT NULL,        -- BALANCED / MISMATCH
+    detail         TEXT NOT NULL DEFAULT ''
+);
+
+-- 授权：控制下载与重新生成；收回后二者失效，审计轨迹保留
+CREATE TABLE IF NOT EXISTS response_authorization (
+    auth_code     TEXT PRIMARY KEY,
+    response_id   BIGINT NOT NULL REFERENCES regulatory_response(id) ON DELETE CASCADE,
+    grantee       TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'ACTIVE',   -- ACTIVE / REVOKED
+    created_by    TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at    TIMESTAMPTZ,
+    revoke_reason TEXT
+);
+
+-- 审计轨迹（授权收回后仍保留）
+CREATE TABLE IF NOT EXISTS response_audit (
+    id          BIGSERIAL PRIMARY KEY,
+    response_id BIGINT,
+    action      TEXT NOT NULL,   -- RESPONSE_CREATED/RESPONSE_CANCELLED/AUTH_GRANTED/AUTH_REVOKED/DOWNLOAD/REGENERATED/SOURCE_REVOKED
+    actor       TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_fact_package ON raw_fact(package_id);
 CREATE INDEX IF NOT EXISTS idx_edge_run ON lineage_edge(run_id);
 CREATE INDEX IF NOT EXISTS idx_gap_run ON evidence_gap(run_id);
 CREATE INDEX IF NOT EXISTS idx_candidate_record ON identity_candidate(identity_record_id);
+CREATE INDEX IF NOT EXISTS idx_cell_response ON response_cell(response_id);
+CREATE INDEX IF NOT EXISTS idx_audit_response ON response_audit(response_id);
